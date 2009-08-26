@@ -1,0 +1,116 @@
+#!/usr/bin/env ruby
+
+def print_usage_and_die!
+  puts "I need path to repo directory!"
+  exit(1)
+end
+
+path = ARGV[0] || print_usage_and_die!
+
+ok = true
+if `which dpkg-scanpackages`.empty?
+  puts "dpkg-scanpackages is missing. Do 'apt-get install dpkg-dev'"
+  ok = false
+end
+
+if `which createrepo`.empty?
+  puts "createrepo is missing. Do 'apt-get install createrepo'"
+  ok = false
+end
+
+unless ok
+  exit(1)
+end
+
+entries = Dir.entries(path)
+entries.delete '.'
+entries.delete '..'
+
+dpkg_entries = []
+yum_entries = []
+
+entries.each do |entry|
+  full_entry = File.join(path, entry)
+  unless File.directory?(full_entry)
+    puts "Warning: skipping unknown repo directory entry: #{entry}"
+    next
+  end
+  if %w[debian ubuntu].include? entry
+    dpkg_entries << full_entry
+    next
+  end
+  if entry =~ /\Afc\d+\z/
+    yum_entries << full_entry
+    next
+  end
+  puts "Warning: skipping unrecognized repo entry: #{entry}"
+end
+
+def sh(*args)
+  puts "# #{args.join(' ')}"
+  result = system(*args)
+  if result
+    return true
+  elsif $?.signaled? && $?.termsig == Signal.list["INT"]
+    raise Interrupt
+  else
+    return false
+  end
+end
+
+dpkg_entries.each do |full_path|
+  # debian/ubuntu entries must contain per-release directories
+  entries = Dir.entries(full_path)
+  entries.delete('.')
+  entries.delete('..')
+  entries.each do |entry|
+    release_directory = File.join(full_path, entry)
+    unless File.directory?(release_directory)
+      puts "Warning: malformed entry for apt-get platform #{File.basename(full_path)}: #{entry}"
+      next
+    end
+    debs = Dir.entries(release_directory)
+    debs.delete('.')
+    debs.delete('..')
+    if debs.empty?
+      puts "Warning: empty directory for apt-get platform #{File.basename(full_path)} release #{entry}"
+    end
+    extra = debs.reject {|n| n =~ /\.deb\z/ || n =~ /\APackages(?:\.gz)?\z/}
+    unless extra.empty?
+      puts "Warning: unexpected content in #{release_directory}: #{extra.inspect}"
+    end
+    Dir.chdir(release_directory) do
+      puts "# chdir #{release_directory}"
+      sh 'dpkg-scanpackages . >Packages'
+      sh 'gzip -9 <Packages >Packages.gz'
+      sh 'bzip2 -9 <Packages >Packages.bz2'
+    end
+  end
+end
+
+yum_entries.each do |full_path|
+  platform = File.basename(full_path)
+  # yum platform insist on separate directory for each arch
+  entries = Dir.entries(full_path)
+  entries.delete('.')
+  entries.delete('..') 
+  entries.each do |arch|
+    arch_directory = File.join(full_path, arch)
+    unless File.directory?(arch_directory)
+      puts "Warning: malformed entry for yum platform #{File.basename(full_path)}: #{arch} (expecting per-arch directories here)"
+      next
+    end
+    rpms = Dir.entries(arch_directory)
+    rpms.delete('.')
+    rpms.delete('..')
+    if rpms.empty?
+      puts "Warning: empty directory for yum #{File.basename(full_path)} arch #{arch}"
+    end
+    re = /#{Regexp.escape(arch)}\.rpm\z/
+    extra = rpms.reject {|n| n =~ re || n == 'repodata'}
+    unless extra.empty?
+      puts "Warning: unexpected content in #{arch_directory}: #{extra.inspect}"
+    end
+    sh "createrepo #{arch_directory}"
+  end
+end

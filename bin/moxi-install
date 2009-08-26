@@ -1,0 +1,337 @@
+#!/usr/bin/env ruby
+# some code here was borrowed with permission from phusion passenger 
+# (http://www.modrails.com)
+
+PERIDOT_ROOT=File.expand_path("#{File.dirname(__FILE__)}/..")
+$:.unshift(File.expand_path(PERIDOT_ROOT+"/lib"))
+
+require 'peridot/utils_mixin'
+require 'peridot/abstract_installer'
+require 'peridot/dependencies'
+require 'tmpdir'
+require 'open-uri'
+require 'fileutils'
+
+module Peridot
+  BINARY_PACKAGE_REPO_URL = 'http://repo.northscale.com'
+  PROXYBUILD_URI = 'file:///root/src/altoros/moxi/proxybuild-cp'
+
+  begin
+    require 'readline'
+    def readline
+      Readline.readline('> ', false).strip
+    end
+  rescue LoadError
+    def readline
+      STDIN.gets.strip
+    end
+  end
+  module_function :readline
+
+  def validate_conflate_jid(jid)
+    namere = /[^"&'\/:<>@%]+/
+    jid =~ /\A#{namere}(:#{namere})?@#{namere}(?:\/#{namere})?\z/ && ($1 || $2)
+  end
+  module_function :validate_conflate_jid
+
+  def with_tmpdir
+    arr = ('a'..'z').to_a
+    attempt = 0
+    path = nil
+
+    begin
+      name = (0..10).map {|_dummy| arr[rand(arr.length)]}.join('')
+      path = "#{Dir::tmpdir}/#{name}"
+      Dir.mkdir(path, 0700)
+    rescue Errno::EEXIST
+      attempt += 1
+      raise if attempt >= 10
+      retry
+    end
+
+    if block_given?
+      begin
+        yield path
+      ensure
+        FileUtils.remove_entry_secure path
+      end
+    else
+      path
+    end
+  end
+  module_function :with_tmpdir
+
+  class BasePackageSystemHandler
+    include UtilsMixin
+
+    def initialize(package_name, repo)
+      @package_name = package_name
+      @repo = repo
+    end
+  end
+
+  class AptSystemHandler < BasePackageSystemHandler
+    # check if known repos already have our package
+    def check_availabity
+      !(`apt-cache show #{@package_name} 2>/dev/null`.strip.empty?)
+    end
+    def add_repo!
+      File.open(repo_config_path,"w") {|f| f.puts "deb #{@repo} ./"}
+      puts "Updating apt package list"
+      sh 'apt-get update'
+    end
+    def upgrade_install_package_cmd
+      "apt-get install #{@package_name}"
+    end
+    def repo_config_path
+      "/etc/apt/sources.list.d/#{@package_name}.list"
+    end
+  end
+
+  class YumSystemHandler < BasePackageSystemHandler
+    def check_availabity
+      system "yum info -C #{@package_name} 2>&1 >/dev/null"
+      $?.success?
+    end
+    def add_repo!
+      File.open(repo_config_path,"w") do |f|
+        f.puts <<HERE
+[fedora]
+name=Northscale #{@package_name} repository
+failovermethod=priority
+baseurl=#{@repo}
+enabled=1
+gpgcheck=0
+HERE
+      end
+    end
+    def upgrade_install_package_cmd
+      "yum install #{@package_name}"
+    end
+    def repo_config_path
+      "/etc/yum.repos.d/#{@package_name}.repo"
+    end
+  end
+
+  def platform_type
+    @@platform_type ||= case `uname -m`.strip
+                        when /\Ai[3456]86\z/
+                          :i386
+                        when 'x86_64'
+                          :x86_64
+                        else
+                          :unknown
+                        end
+  end
+  module_function :platform_type
+
+  def find_binary_package
+    if RUBY_PLATFORM =~ /linux/
+      distro = PlatformInfo.linux_distro
+      case distro
+      when :ubuntu, :debian
+        return unless [:i386, :x86_64].include? platform_type
+        release = unless `which lsb_release`.empty?
+                    `lsb_release -a 2>&1 | grep Release:`.strip =~ /Release:/
+                    $'.strip
+                  else
+                    IO.read('/etc/debian_version').strip
+                  end
+        if distro == :debian
+          case release
+          when /\A5\.0/
+            AptSystemHandler.new('moxi', BINARY_PACKAGE_REPO_URL+'/debian/5.0')
+          else /sid/
+            # try package from latest stable for testing/unstable
+            AptSystemHandler.new('moxi', BINARY_PACKAGE_REPO_URL+'/debian/5.0')
+          end
+        else
+          case release
+          when /\A8\.04/
+            AptSystemHandler.new('moxi', BINARY_PACKAGE_REPO_URL+'/ubuntu/8.04')
+          end
+        end
+      when :rhel
+      when :fedora
+        return unless [:i386, :x86_64].include? platform_type
+        fc_release_string = IO.read('/etc/redhat-release').strip
+        (fc_release_string =~ /(\d+)/) || return
+        fc_release = $1.to_i
+        YumSystemHandler.new('moxi', BINARY_PACKAGE_REPO_URL+'/fc#{fc_release}/#{platform_type}')
+      when :centos
+      end
+    end
+  end
+  module_function :find_binary_package
+
+  class Installer < AbstractInstaller
+    def initialize(tmp_dir, *args)
+      super(*args)
+      @tmp_dir = tmp_dir
+    end
+
+    def install_binary_package(package_handler)
+      already_has = package_handler.check_availabity
+      if already_has
+        puts
+        color_puts "<banner>A binary package of moxi is available for your platform</banner>"
+        cmd = package_handler.upgrade_install_package_cmd
+        color_puts "This installer will attempt to upgrade/install moxi from the package \nrepository:  #{cmd}"
+        continue_or_not
+        return sh(cmd)
+      end
+      
+      color_puts "<banner>There is a repository with a moxi package for your platform.</banner>"
+      color_puts "This installer will now configure the repository in\n #{package_handler.repo_config_path}, so moxi can be installed."
+      continue_or_not
+      package_handler.add_repo!
+
+      color_puts "<banner>The installer will now install moxi from the package repository.</banner>"
+      continue_or_not
+      sh package_handler.upgrade_install_package_cmd
+    end
+
+    def dependencies
+      [Dependencies::Automake,
+       Dependencies::Autoconf,
+       Dependencies::Libtool,
+       Dependencies::Git,
+       Dependencies::Make,
+       Dependencies::Check,
+       Dependencies::Glib2,
+      ]
+    end
+
+    def download_proxybuild_source
+      Dir.chdir(@tmp_dir) do
+        sh "git clone #{PROXYBUILD_URI} proxybuild"
+      end
+    end
+
+    def die(msg)
+      raise(msg)
+    end
+
+    def build_and_install_proxybuild
+      missing_deps = []
+      Dir.chdir(@tmp_dir+"/proxybuild") do
+        sh("./complete-checkout") || die("internal error: build failed")
+        IO::popen("sh -c 'INSTPREFIX=/usr/local ./build' 2>&1", 'r') do |f|
+          while !(f.eof?)
+            line = f.readline
+            print line
+            if line =~ /configure: error:/
+              case line
+              when /openssl headers/
+                missing_deps << Dependencies::LibSSL
+              when /sqlite3/
+                missing_deps << Dependencies::SQLite3
+              when /libevent/
+                missing_deps << Dependencies::LibeventDev
+              end
+            end
+          end
+        end
+        status = $?
+        unless status.success?
+          if status.signaled?
+            if status.termsig == Signal.list["INT"]
+              raise Interrupt
+            end
+            die("build failed because of signal: #{status.inspect}")
+          end
+          if missing_deps.empty?
+            die("build failed for unknown reason")
+          end
+          color_puts "<red>Some required software is not installed.</red>"
+          color_puts "But don't worry, this installer will tell you how to install them.\n"
+          
+          puts
+          color_puts "<banner>Installation instructions for required software</banner>"
+          puts
+
+          missing_deps.each do |dep|
+            print_dependency_installation_instructions(dep)
+            puts
+          end
+
+          die("build failed")
+        end
+        sh 'make -C moxi install'
+      end
+    end
+
+    def install!
+      Dir.chdir(PERIDOT_ROOT) do
+        check_dependencies || exit(1)
+        download_proxybuild_source
+        build_and_install_proxybuild
+      end
+    end
+
+    def configure_moxi
+      if File.file?('/etc/moxi.conf')
+        color_puts "<banner>/etc/moxi.conf already exists. This installer will overwrite it.</banner>"
+        continue_or_not
+      end
+      # TODO: handle moxi.conf overwriting
+      color_puts "<banner>This installer will configure moxi for the NorthScale CloudMemcached service.</banner>"
+      color_puts "Enter your moxi credentials or just hit Enter to leave moxi unconfigured."
+      line = nil
+      loop do
+        line = Peridot.readline
+        return if line.empty?
+        break if Peridot::validate_conflate_jid(line)
+        color_puts "<banner>These credentials are not in the valid format.</banner>\nPlease try again or just hit Enter to leave moxi unconfigured"
+      end
+      File.open("/etc/moxi.conf",'w') {|f| f.puts "apikey=#{line}"}
+      # debian/ubuntu package needs turning 'enable' switch on.
+      if File.file?('/etc/default/moxi')
+        File.open("/etc/default/moxi",'w') do |f|
+          f << (<<HERE)
+# Defaults for moxi initscript
+# sourced by /etc/init.d/moxi
+# installed at /etc/default/moxi by the maintainer scripts
+
+#
+# This is a POSIX shell fragment
+#
+
+# uncomment to enable moxi
+RUN="yes"
+MAXCONN=1024
+PIDFILE=/var/run/moxi/moxi.pid
+PROXY_ARG="-z /etc/moxi.conf"
+# Additional options that are passed to the Daemon.
+DAEMON_OPTS="-u nobody -d -c $MAXCONN $PROXY_ARG -P $PIDFILE"
+HERE
+        end
+      end
+      if RUBY_PLATFORM =~ /linux/
+        sh '/etc/init.d/moxi start'
+      end
+    end
+  end
+end
+
+if Process::uid != 0
+  puts "This installer needs root privileges. Please run via sudo: 'sudo moxi-install'"
+  exit(1)
+end
+
+Peridot::with_tmpdir do |path|
+  installer = Peridot::Installer.new(path, {})
+  installed_binary = false
+  unless ARGV.include?('--no-binary')
+    package_handler = Peridot::find_binary_package
+    if package_handler
+      if installer.install_binary_package(package_handler)
+        installed_binary = true
+      end
+    end
+  end
+  unless installed_binary
+    installer.start
+  end
+  installer.configure_moxi
+end

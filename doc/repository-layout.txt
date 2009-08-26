@@ -1,0 +1,23 @@
+
+Repository layout for peridot
+==============================
+
+debian/
+        5.0/
+                moxi*(i386,amd64).deb
+	<other release>/
+                moxi*(i386,amd64).deb
+ubuntu/
+        8.04/
+                moxi*(i386,amd64).deb
+	<other release>/
+                moxi*(i386,amd64).deb
+fc8/
+        i386/
+                moxi*.i386.rpm
+	x86_64/
+		moxi*.x86_64.rpm
+
+Debian/Ubuntu sections has repository subdirecory per release.
+Fedora releases are represented by top level directories. Per-arch
+subdirectories of those are actual repositories.
